@@ -1,0 +1,43 @@
+[package]
+name = "tray-menu"
+version = "0.1.2"
+edition = "2024"
+description = "Cross-platform tray icon menu builder"
+license = "MIT"
+authors = ["nobane"]
+repository = "https://github.com/nobane/tray-rs"
+homepage = "https://github.com/nobane/tray-rs"
+keywords = ["tray", "system-tray", "tray-icon", "menu"]
+categories = ["gui"]
+
+
+[features]
+default = []
+gtk = ["dep:gtk"]
+qt = ["dep:cxx", "dep:cxx-qt-lib", "dep:cxx-qt-build"]
+serde = ["dep:serde", "tray/serde"]
+
+[dependencies]
+tray = { version = "0.1.2", path = "../tray" }
+dpi = "0.1"
+serde = { version = "1", optional = true, features = ["derive"] }
+
+[target."cfg(target_os = \"linux\")".dependencies]
+gtk = { version = "0.18", optional = true }
+cxx = { version = "1.0", optional = true }
+cxx-qt-lib = { version = "0.7", optional = true }
+
+[target."cfg(target_os = \"linux\")".build-dependencies]
+cxx-qt-build = { version = "0.7", optional = true }
+
+[target."cfg(target_os = \"windows\")".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+[target."cfg(target_os = \"macos\")".dependencies]
+objc2 = "0.6"
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGDirectDisplay"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSMenu", "NSMenuItem"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
