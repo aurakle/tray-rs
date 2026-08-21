@@ -16,11 +16,13 @@ use crate::tray::{
 
 x11rb::atom_manager! {
     pub TrayAtoms: TrayAtomsCookie {
+        _NET_SYSTEM_TRAY_VISUAL,
         _NET_SYSTEM_TRAY_S0,
         _NET_SYSTEM_TRAY_OPCODE,
         _XEMBED,
         _XEMBED_INFO,
         MANAGER,
+        VISUALID,
     }
 }
 
@@ -71,7 +73,11 @@ pub struct TrayIconImpl {
     conn: Arc<RustConnection>,
     screen_num: usize,
     window: Window,
-    gc: Gcontext,
+    pixmap: Pixmap,
+    window_gc: Gcontext,
+    pixmap_gc: Gcontext,
+    colormap: Colormap,
+    depth: u8,
     temp_dir_path: Option<PathBuf>,
     icon_data: Arc<Mutex<Option<IconData>>>,
     running: Arc<AtomicBool>,
@@ -84,7 +90,52 @@ impl TrayIconImpl {
         let conn = Arc::new(conn);
         let screen = &conn.setup().roots[screen_num];
         let atoms = TrayAtoms::new(&conn)?.reply()?;
-        let depth = screen.root_depth;
+
+        let tray_owner = conn.get_selection_owner(atoms._NET_SYSTEM_TRAY_S0)?.reply()?.owner;
+
+        if tray_owner == x11rb::NONE {
+            return Err(crate::Error::NotSupported("The current environment does not have a system tray"));
+        }
+
+        let mut visual = screen.root_visual;
+        let mut depth = screen.root_depth;
+
+        'outer: for depth_type in &screen.allowed_depths {
+            if depth_type.depth == 32 {
+                for visual_type in &depth_type.visuals {
+                    if visual_type.class == VisualClass::TRUE_COLOR {
+                        visual = visual_type.visual_id;
+                        depth = depth_type.depth;
+
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        {
+            let reply = conn.get_property(
+                false,
+                tray_owner,
+                atoms._NET_SYSTEM_TRAY_VISUAL,
+                atoms.VISUALID,
+                0,
+                size_of::<Visualid>() as u32
+            )?.reply()?;
+
+            let mut tray_visual = reply.value32();
+
+            match tray_visual.as_mut().and_then(Iterator::next) {
+                Some(tray_visual) => visual = tray_visual,
+                None => {},
+            }
+        }
+
+        let pixmap = conn.generate_id()?;
+        conn.create_pixmap(depth, pixmap, screen.root, ICON_SIZE, ICON_SIZE)?;
+
+        let colormap = conn.generate_id()?;
+        conn.create_colormap(ColormapAlloc::NONE, colormap, screen.root, visual)?;
 
         let window = conn.generate_id()?;
         conn.create_window(
@@ -97,9 +148,11 @@ impl TrayIconImpl {
             ICON_SIZE,
             0,
             WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
+            visual,
             &CreateWindowAux::new()
-                .background_pixel(screen.black_pixel)
+                .background_pixel(0)
+                .border_pixel(0)
+                .colormap(colormap)
                 .event_mask(
                     EventMask::EXPOSURE
                         | EventMask::BUTTON_PRESS
@@ -111,8 +164,11 @@ impl TrayIconImpl {
                 ),
         )?;
 
-        let gc = conn.generate_id()?;
-        conn.create_gc(gc, window, &CreateGCAux::new())?;
+        let window_gc = conn.generate_id()?;
+        conn.create_gc(window_gc, window, &CreateGCAux::new())?;
+
+        let pixmap_gc = conn.generate_id()?;
+        conn.create_gc(pixmap_gc, pixmap, &CreateGCAux::new())?;
 
         conn.change_property32(
             PropMode::REPLACE,
@@ -122,11 +178,7 @@ impl TrayIconImpl {
             &[0, XEMBED_MAPPED],
         )?;
 
-        let tray_owner = conn.get_selection_owner(atoms._NET_SYSTEM_TRAY_S0)?.reply()?.owner;
-
-        if tray_owner != x11rb::NONE {
-            Self::send_dock_request(&conn, tray_owner, window, &atoms)?;
-        }
+        Self::send_dock_request(&conn, tray_owner, window, &atoms)?;
 
         conn.flush()?;
 
@@ -148,7 +200,7 @@ impl TrayIconImpl {
             let id = id.clone();
             let icon_data = Arc::clone(&icon_data);
             thread::spawn(move || {
-                Self::event_loop(conn, screen_num, window, gc, depth, id, running, icon_data);
+                Self::event_loop(conn, screen_num, window, window_gc, pixmap, pixmap_gc, depth, id, running, icon_data);
             })
         };
 
@@ -156,7 +208,11 @@ impl TrayIconImpl {
             conn,
             screen_num,
             window,
-            gc,
+            window_gc,
+            pixmap,
+            pixmap_gc,
+            colormap,
+            depth,
             temp_dir_path: attrs.temp_dir_path,
             icon_data,
             running,
@@ -185,7 +241,9 @@ impl TrayIconImpl {
         conn: Arc<RustConnection>,
         screen_num: usize,
         window: Window,
-        gc: Gcontext,
+        window_gc: Gcontext,
+        pixmap: Pixmap,
+        pixmap_gc: Gcontext,
         depth: u8,
         id: TrayIconId,
         running: Arc<AtomicBool>,
@@ -196,10 +254,10 @@ impl TrayIconImpl {
                 Ok(Some(event)) => {
                     match &event {
                         x11rb::protocol::Event::Expose(e) if e.window == window => {
-                            Self::draw_icon(&conn, screen_num, window, gc, depth, &icon_data);
+                            Self::draw_icon(&conn, screen_num, window, window_gc, pixmap, pixmap_gc, depth, &icon_data);
                         }
                         x11rb::protocol::Event::ConfigureNotify(e) if e.window == window => {
-                            Self::draw_icon(&conn, screen_num, window, gc, depth, &icon_data);
+                            Self::draw_icon(&conn, screen_num, window, window_gc, pixmap, pixmap_gc, depth, &icon_data);
                         }
                         _ => {}
                     }
@@ -219,7 +277,9 @@ impl TrayIconImpl {
         conn: &RustConnection,
         screen_num: usize,
         window: Window,
-        gc: Gcontext,
+        window_gc: Gcontext,
+        pixmap: Pixmap,
+        pixmap_gc: Gcontext,
         depth: u8,
         icon_data: &Arc<Mutex<Option<IconData>>>,
     ) {
@@ -241,8 +301,8 @@ impl TrayIconImpl {
 
             let _ = conn.put_image(
                 ImageFormat::Z_PIXMAP,
-                window,
-                gc,
+                pixmap,
+                pixmap_gc,
                 win_width as u16,
                 win_height as u16,
                 0,
@@ -251,6 +311,25 @@ impl TrayIconImpl {
                 depth,
                 &bgrx,
             );
+
+            let _ = conn.change_gc(window_gc, &ChangeGCAux::new()
+                .clip_mask(pixmap)
+                .clip_x_origin(0)
+                .clip_y_origin(0));
+
+            let _ = conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                window,
+                window_gc,
+                win_width as u16,
+                win_height as u16,
+                0,
+                0,
+                0,
+                depth,
+                &bgrx,
+            );
+
             let _ = conn.flush();
         } else {
             let screen = &conn.setup().roots[screen_num];
@@ -261,14 +340,14 @@ impl TrayIconImpl {
                 },
                 Err(_) => return,
             };
-            let _ = conn.change_gc(gc, &ChangeGCAux::new().foreground(screen.black_pixel));
+            let _ = conn.change_gc(window_gc, &ChangeGCAux::new().foreground(screen.black_pixel));
             let rect = Rectangle {
                 x: 0,
                 y: 0,
                 width: geom.width,
                 height: geom.height,
             };
-            let _ = conn.poly_fill_rectangle(window, gc, &[rect]);
+            let _ = conn.poly_fill_rectangle(window, window_gc, &[rect]);
             let _ = conn.flush();
         }
     }
@@ -341,8 +420,7 @@ impl TrayIconImpl {
         }
 
         let screen = &self.conn.setup().roots[self.screen_num];
-        let depth = screen.root_depth;
-        Self::draw_icon(&self.conn, self.screen_num, self.window, self.gc, depth, &self.icon_data);
+        Self::draw_icon(&self.conn, self.screen_num, self.window, self.window_gc, self.pixmap, self.pixmap_gc, self.depth, &self.icon_data);
 
         Ok(())
     }
@@ -387,8 +465,11 @@ impl Drop for TrayIconImpl {
         if let Some(handle) = self.event_thread.take() {
             let _ = handle.join();
         }
-        let _ = self.conn.free_gc(self.gc);
         let _ = self.conn.destroy_window(self.window);
+        let _ = self.conn.free_gc(self.window_gc);
+        let _ = self.conn.free_pixmap(self.pixmap);
+        let _ = self.conn.free_gc(self.pixmap_gc);
+        let _ = self.conn.free_colormap(self.colormap);
         let _ = self.conn.flush();
     }
 }
